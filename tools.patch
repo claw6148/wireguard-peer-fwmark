@@ -1,0 +1,117 @@
+diff --git a/src/config.c b/src/config.c
+index e0b4b7c..c65c865 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -467,6 +467,11 @@ static bool process_line(struct config_ctx *ctx, const char *line)
+ 			ret = parse_key(ctx->last_peer->preshared_key, value);
+ 			if (ret)
+ 				ctx->last_peer->flags |= WGPEER_HAS_PRESHARED_KEY;
++		} else if (key_match("XorFwMark")) {
++			uint32_t flags = 0;
++			ret = parse_fwmark(&ctx->last_peer->xor_fwmark, &flags, value);
++			if (ret)
++				ctx->last_peer->flags |= WGPEER_HAS_XOR_FWMARK;
+ 		} else
+ 			goto error;
+ 	} else
+@@ -638,6 +643,13 @@ struct wgdevice *config_read_cmd(char *argv[], int argc)
+ 			peer->flags |= WGPEER_HAS_PRESHARED_KEY;
+ 			argv += 2;
+ 			argc -= 2;
++		} else if (!strcmp(argv[0], "xor-fwmark") && argc >= 2 && peer) {
++			uint32_t flags = 0;
++			if (!parse_fwmark(&peer->xor_fwmark, &flags, argv[1]))
++				goto error;
++			peer->flags |= WGPEER_HAS_XOR_FWMARK;
++			argv += 2;
++			argc -= 2;
+ 		} else {
+ 			fprintf(stderr, "Invalid argument: %s\n", argv[0]);
+ 			goto error;
+diff --git a/src/containers.h b/src/containers.h
+index fb5434f..8b0fd00 100644
+--- a/src/containers.h
++++ b/src/containers.h
+@@ -43,7 +43,8 @@ enum {
+ 	WGPEER_REPLACE_ALLOWEDIPS = 1U << 1,
+ 	WGPEER_HAS_PUBLIC_KEY = 1U << 2,
+ 	WGPEER_HAS_PRESHARED_KEY = 1U << 3,
+-	WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL = 1U << 4
++	WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL = 1U << 4,
++	WGPEER_HAS_XOR_FWMARK = 1U << 5
+ };
+ 
+ struct wgpeer {
+@@ -61,6 +62,7 @@ struct wgpeer {
+ 	struct timespec64 last_handshake_time;
+ 	uint64_t rx_bytes, tx_bytes;
+ 	uint16_t persistent_keepalive_interval;
++	uint32_t xor_fwmark;
+ 
+ 	struct wgallowedip *first_allowedip, *last_allowedip;
+ 	struct wgpeer *next_peer;
+diff --git a/src/ipc-linux.h b/src/ipc-linux.h
+index 5883ffe..d977bd9 100644
+--- a/src/ipc-linux.h
++++ b/src/ipc-linux.h
+@@ -202,6 +202,10 @@ again:
+ 				if (!mnl_attr_put_u16_check(nlh, SOCKET_BUFFER_SIZE, WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL, peer->persistent_keepalive_interval))
+ 					goto toobig_peers;
+ 			}
++			if (peer->flags & WGPEER_HAS_XOR_FWMARK) {
++				if (!mnl_attr_put_u32_check(nlh, SOCKET_BUFFER_SIZE, WGPEER_A_XOR_FWMARK, peer->xor_fwmark))
++					goto toobig_peers;
++			}
+ 		}
+ 		if (flags) {
+ 			if (!mnl_attr_put_u32_check(nlh, SOCKET_BUFFER_SIZE, WGPEER_A_FLAGS, flags))
+@@ -371,6 +375,10 @@ static int parse_peer(const struct nlattr *attr, void *data)
+ 		if (!mnl_attr_validate(attr, MNL_TYPE_U64))
+ 			peer->tx_bytes = mnl_attr_get_u64(attr);
+ 		break;
++	case WGPEER_A_XOR_FWMARK:
++		if (!mnl_attr_validate(attr, MNL_TYPE_U32))
++			peer->xor_fwmark = mnl_attr_get_u32(attr);
++		break;
+ 	case WGPEER_A_ALLOWEDIPS:
+ 		return mnl_attr_parse_nested(attr, parse_allowedips, peer);
+ 	}
+diff --git a/src/show.c b/src/show.c
+index e772339..529f70c 100644
+--- a/src/show.c
++++ b/src/show.c
+@@ -245,6 +245,8 @@ static void pretty_print(struct wgdevice *device)
+ 		}
+ 		if (peer->persistent_keepalive_interval)
+ 			terminal_printf("  " TERMINAL_BOLD "persistent keepalive" TERMINAL_RESET ": %s\n", every(peer->persistent_keepalive_interval));
++		if (peer->xor_fwmark)
++			terminal_printf("  " TERMINAL_BOLD "xor fwmark" TERMINAL_RESET ": 0x%x\n", peer->xor_fwmark);
+ 		if (peer->next_peer)
+ 			terminal_printf("\n");
+ 	}
+diff --git a/src/showconf.c b/src/showconf.c
+index 6e6a4a5..16c10c2 100644
+--- a/src/showconf.c
++++ b/src/showconf.c
+@@ -92,6 +92,9 @@ int showconf_main(int argc, char *argv[])
+ 		if (peer->persistent_keepalive_interval)
+ 			printf("PersistentKeepalive = %u\n", peer->persistent_keepalive_interval);
+ 
++		if (peer->xor_fwmark)
++			printf("XorFwMark = 0x%x\n", peer->xor_fwmark);
++
+ 		if (peer->next_peer)
+ 			printf("\n");
+ 	}
+diff --git a/src/uapi/linux/linux/wireguard.h b/src/uapi/linux/linux/wireguard.h
+index 0efd52c..58467ca 100644
+--- a/src/uapi/linux/linux/wireguard.h
++++ b/src/uapi/linux/linux/wireguard.h
+@@ -180,6 +180,7 @@ enum wgpeer_attribute {
+ 	WGPEER_A_TX_BYTES,
+ 	WGPEER_A_ALLOWEDIPS,
+ 	WGPEER_A_PROTOCOL_VERSION,
++	WGPEER_A_XOR_FWMARK,
+ 	__WGPEER_A_LAST
+ };
+ #define WGPEER_A_MAX (__WGPEER_A_LAST - 1)

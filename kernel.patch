@@ -1,0 +1,139 @@
+diff --git a/drivers/net/wireguard/netlink.c b/drivers/net/wireguard/netlink.c
+index 1c69eb873..22ebb77a1 100644
+--- a/drivers/net/wireguard/netlink.c
++++ b/drivers/net/wireguard/netlink.c
+@@ -40,7 +40,8 @@ static const struct nla_policy peer_policy[WGPEER_A_MAX + 1] = {
+ 	[WGPEER_A_RX_BYTES]				= { .type = NLA_U64 },
+ 	[WGPEER_A_TX_BYTES]				= { .type = NLA_U64 },
+ 	[WGPEER_A_ALLOWEDIPS]				= { .type = NLA_NESTED },
+-	[WGPEER_A_PROTOCOL_VERSION]			= { .type = NLA_U32 }
++	[WGPEER_A_PROTOCOL_VERSION]			= { .type = NLA_U32 },
++	[WGPEER_A_XOR_FWMARK]				= { .type = NLA_U32 }
+ };
+ 
+ static const struct nla_policy allowedip_policy[WGALLOWEDIP_A_MAX + 1] = {
+@@ -142,7 +143,8 @@ get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
+ 				      WGPEER_A_UNSPEC) ||
+ 		    nla_put_u64_64bit(skb, WGPEER_A_RX_BYTES, peer->rx_bytes,
+ 				      WGPEER_A_UNSPEC) ||
+-		    nla_put_u32(skb, WGPEER_A_PROTOCOL_VERSION, 1))
++		    nla_put_u32(skb, WGPEER_A_PROTOCOL_VERSION, 1) ||
++		    nla_put_u32(skb, WGPEER_A_XOR_FWMARK, peer->xor_fwmark))
+ 			goto err;
+ 
+ 		read_lock_bh(&peer->endpoint_lock);
+@@ -486,6 +488,10 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
+ 			wg_packet_send_keepalive(peer);
+ 	}
+ 
++	if (attrs[WGPEER_A_XOR_FWMARK]) {
++		peer->xor_fwmark = nla_get_u32(attrs[WGPEER_A_XOR_FWMARK]);
++	}
++
+ 	if (netif_running(wg->dev))
+ 		wg_packet_send_staged_packets(peer);
+ 
+diff --git a/drivers/net/wireguard/peer.h b/drivers/net/wireguard/peer.h
+index 76e4d3128..e32bbb2d5 100644
+--- a/drivers/net/wireguard/peer.h
++++ b/drivers/net/wireguard/peer.h
+@@ -64,6 +64,7 @@ struct wg_peer {
+ 	struct list_head allowedips_list;
+ 	struct napi_struct napi;
+ 	u64 internal_id;
++	u32 xor_fwmark;
+ };
+ 
+ struct wg_peer *wg_peer_create(struct wg_device *wg,
+diff --git a/drivers/net/wireguard/socket.c b/drivers/net/wireguard/socket.c
+index 04739763e..d268dfc42 100644
+--- a/drivers/net/wireguard/socket.c
++++ b/drivers/net/wireguard/socket.c
+@@ -18,13 +18,13 @@
+ #include <net/ipv6.h>
+ 
+ static int send4(struct wg_device *wg, struct sk_buff *skb,
+-		 struct endpoint *endpoint, u8 ds, struct dst_cache *cache)
++		 struct endpoint *endpoint, u8 ds, struct dst_cache *cache, u32 fwmark)
+ {
+ 	struct flowi4 fl = {
+ 		.saddr = endpoint->src4.s_addr,
+ 		.daddr = endpoint->addr4.sin_addr.s_addr,
+ 		.fl4_dport = endpoint->addr4.sin_port,
+-		.flowi4_mark = wg->fwmark,
++		.flowi4_mark = fwmark,
+ 		.flowi4_proto = IPPROTO_UDP
+ 	};
+ 	struct rtable *rt = NULL;
+@@ -33,7 +33,7 @@ static int send4(struct wg_device *wg, struct sk_buff *skb,
+ 
+ 	skb_mark_not_on_list(skb);
+ 	skb->dev = wg->dev;
+-	skb->mark = wg->fwmark;
++	skb->mark = fwmark;
+ 
+ 	rcu_read_lock_bh();
+ 	sock = rcu_dereference_bh(wg->sock4);
+@@ -95,14 +95,14 @@ static int send4(struct wg_device *wg, struct sk_buff *skb,
+ }
+ 
+ static int send6(struct wg_device *wg, struct sk_buff *skb,
+-		 struct endpoint *endpoint, u8 ds, struct dst_cache *cache)
++		 struct endpoint *endpoint, u8 ds, struct dst_cache *cache, u32 fwmark)
+ {
+ #if IS_ENABLED(CONFIG_IPV6)
+ 	struct flowi6 fl = {
+ 		.saddr = endpoint->src6,
+ 		.daddr = endpoint->addr6.sin6_addr,
+ 		.fl6_dport = endpoint->addr6.sin6_port,
+-		.flowi6_mark = wg->fwmark,
++		.flowi6_mark = fwmark,
+ 		.flowi6_oif = endpoint->addr6.sin6_scope_id,
+ 		.flowi6_proto = IPPROTO_UDP
+ 		/* TODO: addr->sin6_flowinfo */
+@@ -113,7 +113,7 @@ static int send6(struct wg_device *wg, struct sk_buff *skb,
+ 
+ 	skb_mark_not_on_list(skb);
+ 	skb->dev = wg->dev;
+-	skb->mark = wg->fwmark;
++	skb->mark = fwmark;
+ 
+ 	rcu_read_lock_bh();
+ 	sock = rcu_dereference_bh(wg->sock6);
+@@ -172,10 +172,10 @@ int wg_socket_send_skb_to_peer(struct wg_peer *peer, struct sk_buff *skb, u8 ds)
+ 	read_lock_bh(&peer->endpoint_lock);
+ 	if (peer->endpoint.addr.sa_family == AF_INET)
+ 		ret = send4(peer->device, skb, &peer->endpoint, ds,
+-			    &peer->endpoint_cache);
++			    &peer->endpoint_cache, peer->device->fwmark ^ peer->xor_fwmark);
+ 	else if (peer->endpoint.addr.sa_family == AF_INET6)
+ 		ret = send6(peer->device, skb, &peer->endpoint, ds,
+-			    &peer->endpoint_cache);
++			    &peer->endpoint_cache, peer->device->fwmark ^ peer->xor_fwmark);
+ 	else
+ 		dev_kfree_skb(skb);
+ 	if (likely(!ret))
+@@ -221,9 +221,9 @@ int wg_socket_send_buffer_as_reply_to_skb(struct wg_device *wg,
+ 	skb_put_data(skb, buffer, len);
+ 
+ 	if (endpoint.addr.sa_family == AF_INET)
+-		ret = send4(wg, skb, &endpoint, 0, NULL);
++		ret = send4(wg, skb, &endpoint, 0, NULL, wg->fwmark);
+ 	else if (endpoint.addr.sa_family == AF_INET6)
+-		ret = send6(wg, skb, &endpoint, 0, NULL);
++		ret = send6(wg, skb, &endpoint, 0, NULL, wg->fwmark);
+ 	/* No other possibilities if the endpoint is valid, which it is,
+ 	 * as we checked above.
+ 	 */
+diff --git a/include/uapi/linux/wireguard.h b/include/uapi/linux/wireguard.h
+index ae88be14c..6919913bb 100644
+--- a/include/uapi/linux/wireguard.h
++++ b/include/uapi/linux/wireguard.h
+@@ -180,6 +180,7 @@ enum wgpeer_attribute {
+ 	WGPEER_A_TX_BYTES,
+ 	WGPEER_A_ALLOWEDIPS,
+ 	WGPEER_A_PROTOCOL_VERSION,
++	WGPEER_A_XOR_FWMARK,
+ 	__WGPEER_A_LAST
+ };
+ #define WGPEER_A_MAX (__WGPEER_A_LAST - 1)
